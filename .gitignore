@@ -1,0 +1,33 @@
+# Конфиденциальные данные
+.env
+*.pem
+*.key
+
+# Временные файлы
+voice/temp/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Виртуальное окружение
+.venv/
+venv/
+ENV/
+
+# Директории IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Операционные системы
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Дистрибутивы
+dist/
+build/
+*.egg-info/ 
