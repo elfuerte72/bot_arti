@@ -12,6 +12,7 @@ class Settings:
     
     # API keys
     OPENAI_API_KEY: Optional[str] = None
+    TAVILY_API_KEY: Optional[str] = None
     
     # File paths
     VOICE_TEMP_PATH: Path = Path("./voice/temp")
@@ -34,6 +35,7 @@ def load_settings_from_env() -> Settings:
     return Settings(
         BOT_TOKEN=bot_token,
         OPENAI_API_KEY=os.getenv("OPENAI_API_KEY"),
+        TAVILY_API_KEY=os.getenv("TAVILY_API_KEY"),
         VOICE_TEMP_PATH=voice_temp_path,
         DEBUG=os.getenv("DEBUG", "false").lower() == "true",
     )

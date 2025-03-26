@@ -82,7 +82,13 @@ async def synthesize_speech(
     
     try:
         # Configure communication
-        rate_option = f"+{int((rate-1)*100)}%" if rate > 1.0 else f"{int((rate-1)*100)}%"
+        if abs(rate - 1.0) < 0.01:  # Если rate близок к 1.0
+            rate_option = "+0%"
+        else:
+            rate_option = f"+{int((rate-1)*100)}%" if rate > 1.0 else f"{int((rate-1)*100)}%"
+        
+        logger.debug(f"Using rate option: {rate_option} for rate value: {rate}")
+        
         tts = edge_tts.Communicate(
             text=text,
             voice=voice,

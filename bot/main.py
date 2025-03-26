@@ -56,8 +56,19 @@ async def main() -> None:
     # Start polling
     try:
         logging.info("Starting bot polling...")
+        # Более явное удаление вебхуков и пропуск накопившихся обновлений
         await bot.delete_webhook(drop_pending_updates=True)
-        await dp.start_polling(bot)
+        
+        # Короткая пауза, чтобы Telegram-сервер корректно обработал удаление вебхука
+        await asyncio.sleep(1)
+        
+        # Ограничиваем количество попыток при конфликте
+        await dp.start_polling(
+            bot, 
+            allowed_updates=dp.resolve_used_update_types(),
+            handle_as_tasks=True,
+            max_retries=1  # Минимальное количество повторов при ошибке
+        )
     finally:
         logging.warning("Bot polling stopped")
         await bot.session.close()

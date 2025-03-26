@@ -3,13 +3,17 @@ import uuid
 import logging
 
 from aiogram import Router, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, CallbackQuery
+from aiogram.enums import ChatAction
 from aiogram.filters import Command
 
 from config.settings import settings
-from core.command_router import handle_command
+from core.command_router import (
+    handle_command, request_clarification, DialogContext
+)
 from voice.speech_to_text import process_voice_message
 from voice.text_to_speech import synthesize_response
+from core.user_session import get_user_session
 
 # Настраиваем логгер
 logger = logging.getLogger(__name__)
@@ -22,33 +26,48 @@ cmd_router = Router()
 @cmd_router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
     """Handle /start command."""
-    await message.answer(
-        "Привет! Я бот для управления презентациями. "
-        "Отправляй мне текстовые или голосовые команды "
-        "для управления слайдами.\n\n"
-        "Примеры команд: 'следующий слайд', 'назад', 'начать презентацию'."
+    start_text = (
+        "Привет! Я помогу управлять презентацией. "
+        "Говори команды вроде 'следующий слайд', 'начать' или задавай вопросы."
     )
+    await message.answer(start_text)
+    
+    # Озвучиваем приветствие
+    try:
+        voice_text = "Привет! Я бот для управления презентациями. Чем помочь?"
+        voice_response = await synthesize_response(voice_text)
+        voice_file = FSInputFile(voice_response)
+        await message.answer_voice(voice_file)
+        os.remove(voice_response)
+    except Exception as e:
+        logger.exception(f"Error synthesizing start message: {e}")
 
 
 @cmd_router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     """Handle /help command."""
     help_text = (
-        "📝 <b>Текстовые команды:</b>\n"
-        "- следующий слайд\n"
-        "- предыдущий слайд\n"
-        "- пауза\n"
-        "- продолжить\n"
-        "- начать презентацию\n"
-        "- завершить презентацию\n"
-        "- статус\n"
-        "- говори/читай (озвучить следующий блок текста)\n"
-        "- повтори (повторить последний блок)\n"
-        "- ответь на вопрос: [текст вопроса]\n\n"
-        "🎤 <b>Голосовые команды:</b>\n"
-        "Вы также можете отправить голосовое сообщение с любой из команд выше."
+        "Основные команды:\n"
+        "- следующий/предыдущий слайд\n"
+        "- начать/завершить презентацию\n"
+        "- говори/повтори текст\n"
+        "- ответь на вопрос\n"
+        "- поиск информации"
     )
-    await message.answer(help_text, parse_mode="HTML")
+    await message.answer(help_text)
+    
+    # Озвучиваем справку
+    try:
+        voice_text = (
+            "Я управляю презентацией: переключаю слайды, озвучиваю текст, "
+            "отвечаю на вопросы и могу искать информацию."
+        )
+        voice_response = await synthesize_response(voice_text)
+        voice_file = FSInputFile(voice_response)
+        await message.answer_voice(voice_file)
+        os.remove(voice_response)
+    except Exception as e:
+        logger.exception(f"Error synthesizing help message: {e}")
 
 
 @router.message(F.voice)
@@ -59,7 +78,7 @@ async def voice_message_handler(message: Message) -> None:
     Download, save to a temp file, and pass to the STT service.
     """
     # Индикатор обработки
-    processing_msg = await message.answer("🎧 Обрабатываю голосовое сообщение...")
+    processing_msg = await message.answer("Обрабатываю...")
     
     # Create unique file name for voice message
     voice_file_name = f"{uuid.uuid4()}.ogg"
@@ -76,47 +95,95 @@ async def voice_message_handler(message: Message) -> None:
         try:
             text = await process_voice_message(voice_file_path)
         except Exception as e:
-            await message.reply(f"❌ Ошибка распознавания: {str(e)}")
+            await message.reply(f"Ошибка распознавания: {str(e)}")
             await processing_msg.delete()
             return
 
-        # Process the command
+        # Добавляем лог для отладки распознавания
+        logger.info(f"Распознан текст: {text}")
+        
+        # Обрабатываем команду и получаем результат
         result = await handle_command(text)
-        
-        # Prepare response text
-        response_text = f"🎙️ Распознано: \"{text}\"\n\n"
-        
-        # Add execution details if available
-        if "execution_result" in result:
-            exec_result = result["execution_result"]
-            if exec_result["success"]:
-                response_text += f"✅ {exec_result['message']}"
-            else:
-                response_text += f"❌ {exec_result['message']}"
-        else:
-            response_text += (
-                f"Команда: {result['action']} "
-                f"(уверенность: {result['confidence']:.2f})"
-            )
         
         # Delete processing message
         await processing_msg.delete()
         
-        # Reply with text response
-        await message.reply(response_text)
+        # Проверяем наличие множественных команд
+        if "multiple_actions" in result and result["multiple_actions"]:
+            actions = result.get("actions", [])
+            
+            # Форматируем ответ
+            response_parts = []
+            voice_parts = []
+            
+            for action_data in actions:
+                if "execution_result" in action_data:
+                    exec_result = action_data["execution_result"]
+                    
+                    if exec_result["success"]:
+                        # Берем только основной текст
+                        action_text = exec_result.get(
+                            "text_to_speak", 
+                            exec_result["message"]
+                        )
+                        voice_text = action_text
+                    else:
+                        action_text = exec_result["message"]
+                        voice_text = action_text
+                    
+                    response_parts.append(action_text)
+                    voice_parts.append(voice_text)
+                else:
+                    action = action_data["action"]
+                    action_text = f"Выполняю {action}"
+                    response_parts.append(action_text)
+                    voice_parts.append(action_text)
+            
+            # Отправляем краткий ответ
+            if response_parts:
+                await message.reply(". ".join(response_parts))
+                
+                # Озвучиваем ответы
+                try:
+                    voice_text = ". ".join(voice_parts)
+                    voice_response = await synthesize_response(voice_text)
+                    voice_file = FSInputFile(voice_response)
+                    await message.answer_voice(voice_file)
+                    os.remove(voice_response)
+                except Exception as e:
+                    logger.exception(f"Error synthesizing voice response: {e}")
+            
+            return
         
-        # Generate voice response for most commands
-        if (result["confidence"] > 0.8 and "execution_result" in result):
+        # Отправляем ответ для одиночной команды
+        if "execution_result" in result:
             exec_result = result["execution_result"]
             
+            if exec_result["success"]:
+                # Используем прямой ответ без лишних деталей
+                response_text = exec_result.get(
+                    "text_to_speak", 
+                    exec_result["message"]
+                )
+            else:
+                response_text = exec_result["message"]
+            
+            await message.reply(response_text)
+            
             # Special handling for speak_next_block and repeat_last_block
-            if (result["action"] in ["speak_next_block", "repeat_last_block"] and 
-                    exec_result["success"] and "text_to_speak" in exec_result):
+            if (result["action"] in ["speak_next_block", "repeat_last_block"] 
+                    and exec_result["success"] 
+                    and "text_to_speak" in exec_result):
                 try:
+                    # Получаем скорость из параметров или используем по умолчанию
+                    rate = 0.9
+                    if "params" in result and "rate" in result["params"]:
+                        rate = result["params"]["rate"]
+                    
                     # Синтезируем текст со слайда
                     voice_response = await synthesize_response(
                         exec_result["text_to_speak"],
-                        rate=0.9  # Немного медленнее для лучшего понимания
+                        rate=rate
                     )
                     
                     # Send voice message
@@ -127,29 +194,34 @@ async def voice_message_handler(message: Message) -> None:
                     os.remove(voice_response)
                 except Exception as e:
                     logger.exception(f"Error synthesizing slide text: {e}")
-                    await message.answer(
-                        "Не удалось синтезировать речь для текста слайда"
-                    )
-            # Standard response for other commands
+                    await message.answer("Не удалось озвучить текст")
+            # Озвучиваем все успешные команды
             elif exec_result["success"]:
                 try:
-                    voice_response = await synthesize_response(
-                        exec_result["message"]
-                    )
-                    
-                    # Send voice message
+                    voice_response = await synthesize_response(response_text)
                     voice_file = FSInputFile(voice_response)
                     await message.answer_voice(voice_file)
-                    
-                    # Cleanup voice file
                     os.remove(voice_response)
                 except Exception as e:
                     logger.exception(f"Error synthesizing response: {e}")
+        else:
+            await message.reply(f"Выполняю {result['action']}")
+            
+            # Озвучиваем ответ
+            try:
+                voice_text = f"Выполняю {result['action']}"
+                voice_response = await synthesize_response(voice_text)
+                voice_file = FSInputFile(voice_response)
+                await message.answer_voice(voice_file)
+                os.remove(voice_response)
+            except Exception as e:
+                logger.exception(f"Error synthesizing response: {e}")
     
     except Exception as e:
         logger.exception(f"Error processing voice message: {e}")
         await processing_msg.delete()
-        await message.reply(f"❌ Произошла ошибка при обработке сообщения: {str(e)}")
+        err_msg = f"Ошибка при обработке сообщения: {str(e)}"
+        await message.reply(err_msg)
     
     finally:
         # Clean up the temporary file
@@ -163,8 +235,98 @@ async def voice_message_handler(message: Message) -> None:
 @router.message(F.text)
 async def text_message_handler(message: Message) -> None:
     """Handle text messages and process as commands."""
+    # Показываем пользователю, что бот обрабатывает сообщение
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    
+    # Получаем контекст диалога и сессию пользователя
+    user_session = get_user_session(message.from_user.id)
+    
+    # Если ожидаем уточнения, обрабатываем ответ по-особому
+    if user_session["awaiting_clarification"]:
+        # Сбрасываем флаг ожидания уточнения
+        user_session["awaiting_clarification"] = False
+        # Дополнительная обработка уточнения может быть здесь
+    
     # Process the command
     result = await handle_command(message.text)
+    
+    # Если нужно уточнение
+    if result["action"] == "need_clarification":
+        clarification = await request_clarification(message.text)
+        await message.reply(clarification["message"])
+        
+        # Озвучиваем запрос уточнения
+        try:
+            voice_response = await synthesize_response(
+                clarification["message"]
+            )
+            voice_file = FSInputFile(voice_response)
+            await message.answer_voice(voice_file)
+            os.remove(voice_response)
+        except Exception as e:
+            logger.exception(f"Error synthesizing clarification: {e}")
+        
+        # Обновляем контекст
+        user_session["awaiting_clarification"] = True
+        user_session["last_message"] = message.text
+        return
+    
+    # Проверяем, содержит ли результат несколько команд
+    if "multiple_actions" in result and result["multiple_actions"]:
+        # Обновляем контекст диалога с последним действием
+        actions = result.get("actions", [])
+        if actions:
+            last_action = actions[-1]["action"]
+            user_session["last_action"] = last_action
+            user_session["last_message"] = message.text
+        
+        # Формируем общий ответ для всех команд
+        response_parts = []
+        voice_parts = []
+        
+        for action_data in actions:
+            if "execution_result" in action_data:
+                exec_result = action_data["execution_result"]
+                
+                if exec_result["success"]:
+                    # Берем только основной текст без форматирования
+                    response_text = exec_result.get(
+                        "text_to_speak", 
+                        exec_result["message"]
+                    )
+                    voice_text = response_text
+                else:
+                    response_text = exec_result["message"]
+                    voice_text = response_text
+                
+                # Добавляем в общий ответ
+                response_parts.append(response_text)
+                voice_parts.append(voice_text)
+            else:
+                action = action_data["action"]
+                action_text = f"Выполняю {action}"
+                response_parts.append(action_text)
+                voice_parts.append(action_text)
+        
+        # Отправляем объединенный ответ
+        if response_parts:
+            await message.reply(". ".join(response_parts))
+            
+            # Озвучиваем ответ
+            try:
+                voice_text = ". ".join(voice_parts)
+                voice_response = await synthesize_response(voice_text)
+                voice_file = FSInputFile(voice_response)
+                await message.answer_voice(voice_file)
+                os.remove(voice_response)
+            except Exception as e:
+                logger.exception(f"Error synthesizing response: {e}")
+        
+        return
+    
+    # Обновляем контекст диалога
+    user_session["last_action"] = result["action"]
+    user_session["last_message"] = message.text
     
     # If command is recognized with sufficient confidence
     if result["confidence"] > 0.7:
@@ -173,20 +335,30 @@ async def text_message_handler(message: Message) -> None:
             exec_result = result["execution_result"]
             
             if exec_result["success"]:
-                response_text = f"✅ {exec_result['message']}"
+                # Используем прямой ответ без лишних деталей
+                response_text = exec_result.get(
+                    "text_to_speak", 
+                    exec_result["message"]
+                )
             else:
-                response_text = f"❌ {exec_result['message']}"
+                response_text = exec_result["message"]
             
             await message.reply(response_text)
             
             # Special handling for speak_next_block and repeat_last_block
-            if (result["action"] in ["speak_next_block", "repeat_last_block"] and 
-                    exec_result["success"] and "text_to_speak" in exec_result):
+            if (result["action"] in ["speak_next_block", "repeat_last_block"] 
+                    and exec_result["success"] 
+                    and "text_to_speak" in exec_result):
                 try:
+                    # Получаем скорость из параметров или используем по умолчанию
+                    rate = 0.9
+                    if "params" in result and "rate" in result["params"]:
+                        rate = result["params"]["rate"]
+                    
                     # Синтезируем текст со слайда
                     voice_response = await synthesize_response(
                         exec_result["text_to_speak"],
-                        rate=0.9  # Немного медленнее для лучшего понимания
+                        rate=rate
                     )
                     
                     # Send voice message
@@ -197,38 +369,79 @@ async def text_message_handler(message: Message) -> None:
                     os.remove(voice_response)
                 except Exception as e:
                     logger.exception(f"Error synthesizing slide text: {e}")
-                    await message.answer(
-                        "Не удалось синтезировать речь для текста слайда"
-                    )
-            # Optional voice response for successful commands
-            elif exec_result["success"] and result["confidence"] > 0.85:
+                    await message.answer("Не удалось озвучить текст")
+            # Озвучиваем все успешные команды
+            elif exec_result["success"]:
                 try:
-                    voice_response = await synthesize_response(
-                        exec_result["message"]
-                    )
+                    voice_response = await synthesize_response(response_text)
                     voice_file = FSInputFile(voice_response)
                     await message.answer_voice(voice_file)
                     os.remove(voice_response)
                 except Exception as e:
                     logger.exception(f"Error synthesizing response: {e}")
         else:
-            await message.reply(
-                f"Выполняю команду: {result['action']} "
-                f"(уверенность: {result['confidence']:.2f})"
-            )
+            await message.reply(f"Выполняю {result['action']}")
+            
+            # Озвучиваем сообщение о выполнении команды
+            try:
+                voice_text = f"Выполняю {result['action']}"
+                voice_response = await synthesize_response(voice_text)
+                voice_file = FSInputFile(voice_response)
+                await message.answer_voice(voice_file)
+                os.remove(voice_response)
+            except Exception as e:
+                logger.exception(f"Error synthesizing response: {e}")
     else:
         # Сообщение о нераспознанной команде
-        help_hint = (
-            "Используйте /help для просмотра доступных команд."
-        )
-        
         # Если хотя бы минимальная уверенность, предлагаем возможную команду
         if result["confidence"] > 0.3:
-            await message.reply(
-                f"🤔 Не удалось распознать команду. Возможно, вы имели в виду "
-                f"'{result['action']}'?\n\n{help_hint}"
-            )
+            message_text = f"Не понимаю. Возможно, вы имели в виду {result['action']}?"
+            await message.reply(message_text)
+            
+            # Озвучиваем ответ
+            try:
+                voice_response = await synthesize_response(message_text)
+                voice_file = FSInputFile(voice_response)
+                await message.answer_voice(voice_file)
+                os.remove(voice_response)
+            except Exception as e:
+                logger.exception(f"Error synthesizing response: {e}")
         else:
-            await message.reply(
-                f"❓ Не удалось распознать команду. {help_hint}"
-            )
+            message_text = "Не понимаю эту команду"
+            await message.reply(message_text)
+            
+            # Озвучиваем ответ
+            try:
+                voice_response = await synthesize_response(message_text)
+                voice_file = FSInputFile(voice_response)
+                await message.answer_voice(voice_file)
+                os.remove(voice_response)
+            except Exception as e:
+                logger.exception(f"Error synthesizing response: {e}")
+
+
+@router.callback_query()
+async def callback_handler(query: CallbackQuery) -> None:
+    """Обработка нажатий на кнопки клавиатуры"""
+    # Подтверждаем получение запроса для мгновенной обратной связи
+    await query.answer()
+    
+    # Обновляем интерфейс, добавляя emoji-реакцию к сообщению
+    if query.message:
+        # Показываем реакцию в интерфейсе
+        emoji_map = {
+            "next_slide": "➡️",
+            "prev_slide": "⬅️",
+            "pause": "⏸",
+            "resume": "▶️",
+            "speak_next_block": "🔊",
+            "end_presentation": "🛑"
+        }
+        
+        action = query.data
+        if action in emoji_map:
+            try:
+                # Добавляем соответствующую реакцию на сообщение
+                await query.message.react([emoji_map[action]])
+            except Exception as e:
+                logger.exception(f"Ошибка при добавлении реакции: {e}")

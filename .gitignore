@@ -1,20 +1,43 @@
-# Конфиденциальные данные
-.env
-*.pem
-*.key
-
-# Временные файлы
-voice/temp/
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Виртуальное окружение
+*.so
+.Python
 .venv/
-venv/
-ENV/
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
 
-# Директории IDE
+# Node modules
+node_modules/
+
+# Временные файлы
+voice/temp/*
+!voice/temp/.gitkeep
+
+# Архивы
+*.zip
+
+# Конфиденциальная информация
+.env
+
+# macOS
+.DS_Store
+
+# IDE
 .idea/
 .vscode/
 *.swp
