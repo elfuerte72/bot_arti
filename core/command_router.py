@@ -1,15 +1,15 @@
-from typing import Dict, Any, List, Tuple
 import re
-import logging
 import os
 import time
+import logging
+import asyncio
+from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 import openai
-import asyncio
 
-from slides import keynote_controller
+from core.presentation_state import PresentationState, PresentationContext
 from core.question_handler import QuestionHandler
-from core.presentation_state import PresentationContext, PresentationState
+from slides import keynote_controller
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -17,35 +17,38 @@ load_dotenv()
 # Инициализация API ключа OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# Настраиваем логгер
 logger = logging.getLogger(__name__)
 
 # Маппинг команд с ключевыми словами и синонимами
-COMMAND_PATTERNS: Dict[str, List[Tuple[str, float]]] = {
+COMMAND_PATTERNS = {
     "next_slide": [
-        (r"\b(next|forward|следующий|вперед|далее)\s+(slide|слайд)\b", 0.95),
-        (r"\b(next|forward|следующий|вперед|далее)\b", 0.85),
-        (r"\bслед(ующий)?\s+слайд\b", 0.95),
+        (r"\b(дальше|далее|след|next|вперед|вперёд)\b", 0.9),
+        (r"\b(покажи|показать)\s+(следующий|след)\s+(слайд|slide)\b", 0.95),
     ],
     "previous_slide": [
-        (r"\b(previous|back|назад|предыдущий)\s+(slide|слайд)\b", 0.95),
-        (r"\b(previous|back|назад|предыдущий)\b", 0.85),
-        (r"\bпред(ыдущий)?\s+слайд\b", 0.95),
+        (r"\b(назад|back|пред|предыдущий)\b", 0.9),
+        (r"\b(покажи|показать)\s+(предыдущий|пред)\s+(слайд|slide)\b", 0.95),
     ],
     "pause": [
-        (r"\b(pause|stop|пауза|стоп|остановить)\b", 0.9),
+        (r"\b(стоп|пауза|pause|останови|подожди)\b", 0.9),
+        (r"\b(сделай|поставь)\s+(паузу|остановку)\b", 0.95),
     ],
     "resume": [
-        (r"\b(continue|resume|продолжить|продолжай|возобновить)\b", 0.9),
+        (r"\b(продолжи|продолжай|продолжить|go on|resume|дальше)\b", 0.9),
+        (r"\b(убери|сними)\s+(паузу|остановку)\b", 0.95),
     ],
     "start": [
-        (r"\b(start|begin|начать|запустить|начни)\s+"
-         r"(presentation|презентацию|показ|семинар)\b", 0.95),
-        (r"\b(begin|start|начни семинар)\b", 0.8),
+        (r"\b(начни|начать|старт|start|запусти|запуск)\b", 0.85),
+        (r"\b(начни|начать|старт|запуск)\s+(презентацию|показ|presentation)\b", 0.95),
     ],
     "end_presentation": [
-        (r"\b(end|finish|закончить|завершить)\s+"
-         r"(presentation|презентацию|показ)\b", 0.95),
-        (r"\b(end|finish|exit|quit|выход|выйти)\b", 0.8),
+        (r"\b(закончи|закончить|конец|end|завершить|стоп)\b", 0.85),
+        (r"\b(закончи|закончить|заверши|стоп)\s+(презентацию|показ|presentation)\b", 0.95),
+    ],
+    "status": [
+        (r"\b(статус|status|состояние)\b", 0.9),
+        (r"\b(какой|текущий)\s+(статус|слайд|состояние)\b", 0.95),
     ],
     "speak_next_block": [
         (r"\b(говори|читай|озвучь|скажи)\b", 0.9),
@@ -73,12 +76,18 @@ COMMAND_PATTERNS: Dict[str, List[Tuple[str, float]]] = {
 COMMAND_FUNCTIONS = {
     "next_slide": keynote_controller.next_slide,
     "previous_slide": keynote_controller.previous_slide,
+    "stop": keynote_controller.pause_presentation,  # stop maps to pause
+    "start_presentation": keynote_controller.start_presentation,
+    "generate_answer": keynote_controller.handle_question,  # generate_answer maps to handle_question
+    "explain_simpler": keynote_controller.speak_next_block,  # explain_simpler maps to speak_next_block
+    "summarize": keynote_controller.generate_summary,  # summarize maps to generate_summary
+    
+    # Keep legacy mappings for backward compatibility
     "pause": keynote_controller.pause_presentation,
     "resume": keynote_controller.pause_presentation,
     "start": keynote_controller.start_presentation,
     "end_presentation": keynote_controller.end_presentation,
     "status": keynote_controller.get_presentation_status,
-    # Добавляем реализованные функции
     "speak_next_block": keynote_controller.speak_next_block,
     "repeat_last_block": keynote_controller.repeat_last_block,
     "handle_question": keynote_controller.handle_question,
@@ -478,90 +487,196 @@ async def handle_command(text: str) -> Dict[str, Any]:
     context = PresentationContext()
     await context.update_state()
     
-    # Определяем действие из текста с учетом контекста
-    result = await identify_action(text, context.state)
-    
-    # Проверяем, распознано ли несколько действий
-    if "multiple_actions" in result and result["multiple_actions"]:
-        return await handle_multiple_commands(text, result, context)
-    
-    # Обработка одиночной команды
-    action = result["action"]
-    confidence = result["confidence"]
-    
-    logger.info(f"Identified action: {action} (confidence: {confidence:.2f})")
-    
-    # Если мы не уверены в действии, запросим уточнение
-    if confidence < 0.5 or action == "unknown" or action == "need_clarification":
-        logger.warning(f"Low confidence ({confidence:.2f}) for action: {action}")
-        
-        # Добавляем контекстную информацию в сообщение
-        context_hint = context.get_status_message()
-        
-        result = {
-            "action": "need_clarification",
-            "confidence": confidence,
-            "message": f"Я не уверен, какую команду выполнить. {context_hint}"
+    # Используем новую функцию analyze_text для определения намерения
+    try:
+        # Подготавливаем контекст для анализа
+        analysis_context = {
+            "presentation_state": context.state.value if context.state else "UNKNOWN"
         }
-        return result
-    
-    # Проверяем, возможно ли выполнить действие в текущем состоянии
-    validation = await context.validate_action(action)
-    if not validation["valid"]:
-        return {
-            "action": action,
-            "confidence": confidence,
-            "execution_result": {
-                "success": False,
-                "message": validation["message"]
+        
+        # Анализируем текст с помощью GPT
+        from core.question_handler import analyze_text
+        result = await analyze_text(text, analysis_context)
+        
+        # Убедимся, что result не None
+        if result is None:
+            logger.error("analyze_text вернул None вместо словаря")
+            result = {
+                "action": "need_clarification",
+                "confidence": 0.3,
+                "message": "Произошла ошибка при обработке команды. Попробуйте еще раз."
             }
-        }
+        
+        # Проверяем результат и обрабатываем его
+        action = result.get("action", "unknown")
+        params = result.get("params", {})
+        response = result.get("response", "")
+        
+        logger.info(f"Identified action: {action} with params: {params}")
+        
+        # Если требуется уточнение
+        if action == "need_clarification":
+            return {
+                "action": "need_clarification",
+                "confidence": result.get("confidence", 0.3),
+                "message": response
+            }
+        
+        # Проверяем, возможно ли выполнить действие в текущем состоянии
+        validation = await context.validate_action(action)
+        if not validation["valid"]:
+            return {
+                "action": action,
+                "confidence": result.get("confidence", 0.9),
+                "execution_result": {
+                    "success": False,
+                    "message": validation["message"],
+                    "text_to_speak": response
+                }
+            }
+        
+        # Если функция существует, вызываем её
+        if action in COMMAND_FUNCTIONS:
+            try:
+                # Передаем параметры и контекст в функцию
+                fn = COMMAND_FUNCTIONS[action]
+                
+                # Проверяем подпись функции
+                import inspect
+                sig = inspect.signature(fn)
+                
+                # Фильтруем параметры, оставляя только те, которые есть в сигнатуре
+                supported_params = {}
+                for param_name, param in sig.parameters.items():
+                    if param_name in params:
+                        supported_params[param_name] = params[param_name]
+                
+                # Вызываем функцию с отфильтрованными параметрами
+                execution_result = await fn(**supported_params)
+                
+                # Если команда выполнена, обновляем состояние
+                if execution_result.get("success", False):
+                    await context.update_state()
+                
+                # Добавляем ответ из GPT в результат выполнения
+                if "text_to_speak" not in execution_result:
+                    execution_result["text_to_speak"] = response
+                
+                # Добавляем результат выполнения в ответ
+                return {
+                    "action": action,
+                    "confidence": result.get("confidence", 0.9),
+                    "params": params,
+                    "execution_result": execution_result
+                }
+            except Exception as e:
+                logger.exception(f"Error executing command '{action}': {e}")
+                return {
+                    "action": action,
+                    "confidence": result.get("confidence", 0.9),
+                    "execution_result": {
+                        "success": False,
+                        "message": f"Ошибка при выполнении: {str(e)}",
+                        "text_to_speak": response
+                    }
+                }
+        else:
+            logger.warning(f"No handler for action: {action}")
+            return {
+                "action": action,
+                "confidence": result.get("confidence", 0.9),
+                "execution_result": {
+                    "success": False,
+                    "message": f"Неизвестная команда: {action}",
+                    "text_to_speak": response
+                }
+            }
+    except Exception as e:
+        logger.exception(f"Error in command handling: {e}")
+        # Если произошла ошибка, используем запасной вариант с регулярными выражениями
+        result = await identify_action(text, context.state)
+        
+        # Убедимся, что result не None
+        if result is None:
+            logger.error("identify_action вернул None вместо словаря")
+            return {
+                "action": "need_clarification",
+                "confidence": 0.3,
+                "message": "Произошла ошибка при обработке команды. Попробуйте еще раз."
+            }
+        
+        # Остальной код для оригинального метода определения действий
+        action = result["action"]
+        confidence = result["confidence"]
+        
+        # Если мы не уверены в действии, запросим уточнение
+        if confidence < 0.5 or action == "unknown" or action == "need_clarification":
+            # Добавляем контекстную информацию в сообщение
+            context_hint = context.get_status_message()
+            result = {
+                "action": "need_clarification",
+                "confidence": confidence,
+                "message": f"Я не уверен, какую команду выполнить. {context_hint}"
+            }
+            return result
     
-    # Извлекаем параметры из текста для найденного действия
-    params = await extract_parameters(text, action)
-    
-    # Добавляем параметры в результат
-    result["params"] = params
-    
-    # Если функция существует, вызываем её
-    if action in COMMAND_FUNCTIONS:
-        try:
-            # Передаем параметры и контекст в функцию
-            fn = COMMAND_FUNCTIONS[action]
-            
-            # Проверяем подпись функции
-            import inspect
-            sig = inspect.signature(fn)
-            
-            # Фильтруем параметры, оставляя только те, которые есть в сигнатуре
-            supported_params = {}
-            for param_name, param in sig.parameters.items():
-                if param_name in params:
-                    supported_params[param_name] = params[param_name]
-            
-            # Вызываем функцию с отфильтрованными параметрами
-            execution_result = await fn(**supported_params)
-            
-            # Если команда выполнена, обновляем состояние
-            if execution_result.get("success", False):
-                await context.update_state()
-            
-            # Добавляем результат выполнения в ответ
-            result["execution_result"] = execution_result
-        except Exception as e:
-            logger.exception(f"Error executing command '{action}': {e}")
+        # Проверяем, возможно ли выполнить действие в текущем состоянии
+        validation = await context.validate_action(action)
+        if not validation["valid"]:
+            return {
+                "action": action,
+                "confidence": confidence,
+                "execution_result": {
+                    "success": False,
+                    "message": validation["message"]
+                }
+            }
+        
+        # Извлекаем параметры из текста для найденного действия
+        params = await extract_parameters(text, action)
+        
+        # Добавляем параметры в результат
+        result["params"] = params
+        
+        # Если функция существует, вызываем её
+        if action in COMMAND_FUNCTIONS:
+            try:
+                # Передаем параметры и контекст в функцию
+                fn = COMMAND_FUNCTIONS[action]
+                
+                # Проверяем подпись функции
+                import inspect
+                sig = inspect.signature(fn)
+                
+                # Фильтруем параметры, оставляя только те, которые есть в сигнатуре
+                supported_params = {}
+                for param_name, param in sig.parameters.items():
+                    if param_name in params:
+                        supported_params[param_name] = params[param_name]
+                
+                # Вызываем функцию с отфильтрованными параметрами
+                execution_result = await fn(**supported_params)
+                
+                # Если команда выполнена, обновляем состояние
+                if execution_result.get("success", False):
+                    await context.update_state()
+                
+                # Добавляем результат выполнения в ответ
+                result["execution_result"] = execution_result
+            except Exception as e:
+                logger.exception(f"Error executing command '{action}': {e}")
+                result["execution_result"] = {
+                    "success": False,
+                    "message": f"Ошибка при выполнении: {str(e)}"
+                }
+        else:
+            logger.warning(f"No handler for action: {action}")
             result["execution_result"] = {
                 "success": False,
-                "message": f"Ошибка при выполнении: {str(e)}"
+                "message": f"Неизвестная команда: {action}"
             }
-    else:
-        logger.warning(f"No handler for action: {action}")
-        result["execution_result"] = {
-            "success": False,
-            "message": f"Неизвестная команда: {action}"
-        }
-    
-    return result
+        
+        return result
 
 # Добавляем временное хранилище контекста
 class DialogContext:

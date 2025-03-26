@@ -5,6 +5,7 @@ from openai import AsyncOpenAI
 
 from config.settings import settings
 from core.tavily_search import TavilyAPI
+from core.system_prompts import get_system_prompt
 
 # Настраиваем логгер
 logger = logging.getLogger(__name__)
@@ -26,6 +27,89 @@ async def get_openai_client() -> AsyncOpenAI:
             raise ValueError("OpenAI API key is not set")
         _openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
     return _openai_client
+
+
+async def analyze_text(text: str, context: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Анализирует текст с помощью GPT и возвращает структурированный ответ с действием и ответом.
+    
+    Args:
+        text: Текст для анализа
+        context: Дополнительный контекст для промпта (опционально)
+        
+    Returns:
+        Структурированный ответ с полями action, params и response
+    """
+    try:
+        # Получаем системный промпт в стиле JARVIS с контекстом
+        system_prompt = get_system_prompt(context)
+        
+        # Готовим запрос к API
+        client = await get_openai_client()
+        response = await client.chat.completions.create(
+            model="gpt-4-turbo-preview",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        # Извлекаем ответ
+        try:
+            import json
+            response_text = response.choices[0].message.content
+            structured_response = json.loads(response_text)
+            
+            # Проверяем наличие всех необходимых полей
+            if "action" not in structured_response:
+                structured_response["action"] = "unknown"
+            
+            if "params" not in structured_response:
+                structured_response["params"] = {}
+                
+            if "response" not in structured_response:
+                structured_response["response"] = "Я не совсем понял, что вы хотите. Могли бы вы уточнить?"
+            
+            # Преобразуем действия в совместимый формат
+            # Маппинг действий из нового промпта в старые имена действий
+            action_mapping = {
+                "start_presentation": "start",
+                "stop": "pause",
+                "generate_answer": "handle_question",
+                "explain_simpler": "speak_next_block",
+                "summarize": "generate_summary",
+                "unknown": "need_clarification"
+            }
+            
+            # Применяем маппинг, если нужно
+            if structured_response["action"] in action_mapping:
+                structured_response["action"] = action_mapping[structured_response["action"]]
+            
+            # Добавляем уровень уверенности для совместимости
+            structured_response["confidence"] = 0.9
+                
+            return structured_response
+            
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Ошибка при разборе ответа OpenAI: {e}")
+            return {
+                "action": "need_clarification",
+                "params": {},
+                "response": "Произошла ошибка при обработке вашего запроса. Повторите, пожалуйста.",
+                "confidence": 0.3
+            }
+            
+    except Exception as e:
+        logger.exception(f"Ошибка при обращении к OpenAI API: {e}")
+        return {
+            "action": "need_clarification",
+            "params": {},
+            "response": f"Не удалось обработать запрос: {str(e)}",
+            "confidence": 0.3
+        }
 
 
 class QuestionHandler:
